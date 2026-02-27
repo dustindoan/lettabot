@@ -1510,7 +1510,7 @@ export async function onboard(options?: { nonInteractive?: boolean }): Promise<v
   
   // Create agent eagerly if user chose "new" and we don't have an ID yet
   if (config.agentChoice === 'new' && !config.agentId) {
-    const { createAgent } = await import('@letta-ai/letta-code-sdk');
+    const { createAgent } = await import('./letta/index.js');
     const { updateAgentName, ensureNoToolApprovals } = await import('./tools/letta-api.js');
     const { installSkillsToAgent } = await import('./skills/loader.js');
     const { loadMemoryBlocks } = await import('./core/memory.js');

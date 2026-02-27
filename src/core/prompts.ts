@@ -29,6 +29,15 @@ export interface HeartbeatTodo {
   completed: boolean;
 }
 
+/**
+ * MCP tool context passed to heartbeat prompts so the agent knows
+ * what tools are available and gets coaching guidance on using them.
+ */
+export interface HeartbeatToolContext {
+  /** MCP tool names available to the agent (e.g. "get-recent-activities", "list-events") */
+  toolNames: string[];
+}
+
 function isSameCalendarDay(a: Date, b: Date): boolean {
   return a.getFullYear() === b.getFullYear()
     && a.getMonth() === b.getMonth()
@@ -55,6 +64,39 @@ function formatDueLabel(due: string, now: Date): string {
     return `OVERDUE since ${dueAt.toLocaleString()}`;
   }
   return `due ${dueAt.toLocaleString()}`;
+}
+
+function buildToolsSection(tools?: HeartbeatToolContext): string {
+  if (!tools || tools.toolNames.length === 0) return '';
+
+  // Group tools by source (inferred from name patterns)
+  const stravaTools = tools.toolNames.filter(t => t.toLowerCase().includes('strava') || t.toLowerCase().includes('activit') || t.toLowerCase().includes('athlete'));
+  const calendarTools = tools.toolNames.filter(t => t.toLowerCase().includes('calendar') || t.toLowerCase().includes('event'));
+  const otherTools = tools.toolNames.filter(t => !stravaTools.includes(t) && !calendarTools.includes(t));
+
+  const lines: string[] = [];
+  if (stravaTools.length > 0) {
+    lines.push(`• Strava (${stravaTools.length} tools): workouts, training load, recovery`);
+  }
+  if (calendarTools.length > 0) {
+    lines.push(`• Google Calendar (${calendarTools.length} tools): schedule, upcoming sessions`);
+  }
+  if (otherTools.length > 0) {
+    lines.push(`• Other: ${otherTools.join(', ')}`);
+  }
+
+  return `
+AVAILABLE TOOLS:
+${lines.join('\n')}
+
+You have MCP tools to check your athlete's data. Use your judgment:
+- Check what's relevant (don't query everything every time)
+- If they worked out → acknowledge, give feedback
+- If they missed a planned session → gentle check-in
+- If a big workout is coming up → prep/motivation
+- If nothing notable → just end your turn
+Use lettabot-message to reach out only when you have something worth saying.
+`.trim();
 }
 
 function buildHeartbeatTodoSection(todos: HeartbeatTodo[], now: Date): string {
@@ -84,8 +126,10 @@ export function buildHeartbeatPrompt(
   intervalMinutes: number,
   todos: HeartbeatTodo[] = [],
   now: Date = new Date(),
+  tools?: HeartbeatToolContext,
 ): string {
   const todoSection = buildHeartbeatTodoSection(todos, now);
+  const toolsSection = buildToolsSection(tools);
   return `
 ${SILENT_MODE_PREFIX}
 
@@ -102,6 +146,8 @@ To actually contact your human, run:
   lettabot-message send --text "Your message here"
 
 ${todoSection || 'PENDING TO-DOS: none right now.'}
+
+${toolsSection}
 
 This is your time. You can:
 • Work on a project you've been thinking about
@@ -129,8 +175,10 @@ export function buildCustomHeartbeatPrompt(
   intervalMinutes: number,
   todos: HeartbeatTodo[] = [],
   now: Date = new Date(),
+  tools?: HeartbeatToolContext,
 ): string {
   const todoSection = buildHeartbeatTodoSection(todos, now);
+  const toolsSection = buildToolsSection(tools);
   return `
 ${SILENT_MODE_PREFIX}
 
@@ -145,6 +193,8 @@ To actually contact your human, run:
   lettabot-message send --text "Your message here"
 
 ${todoSection || 'PENDING TO-DOS: none right now.'}
+
+${toolsSection}
 
 ${customPrompt}
 `.trim();
@@ -253,4 +303,27 @@ You can also use \`lettabot-react\` to add emoji reactions:
     lettabot-react add --emoji :eyes: --channel telegram --chat 123456789 --message 987654321
 
 The system will tell you if you're in "silent mode" where the CLI is required.
+`.trim();
+
+/**
+ * Service Connections persona — teaches the agent to handle AUTH_REQUIRED errors
+ * from MCP tools that need OAuth authorization.
+ *
+ * When a tool (Strava, Google Calendar, etc.) returns AUTH_REQUIRED, it means
+ * the user hasn't connected that service yet, or their token expired.
+ * The error may include an authorization URL the agent should relay to the user.
+ */
+export const SERVICE_CONNECTIONS_PERSONA = `
+## Service Connections
+
+When a tool returns an error containing "AUTH_REQUIRED":
+1. The error message may contain an authorization URL after "Authorize at:" — send it to the user
+2. If no URL is provided, tell the user they need to connect the service and ask them to contact the system admin
+3. After the user confirms they've authorized, retry the original tool call
+
+Example response: "I need access to your Strava to check your workouts. Please visit this link to connect your account: [url from error]"
+
+Important:
+- Never fabricate authorization URLs — only use URLs from the AUTH_REQUIRED error
+- If the tool just says authentication is needed without a URL, explain the situation and suggest the user reach out to get connected
 `.trim();

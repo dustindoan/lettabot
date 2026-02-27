@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 
-vi.mock('@letta-ai/letta-code-sdk', () => ({
+vi.mock('../letta/index.js', () => ({
   createAgent: vi.fn(),
   createSession: vi.fn(),
   resumeSession: vi.fn(),
@@ -11,7 +11,7 @@ vi.mock('@letta-ai/letta-code-sdk', () => ({
   imageFromURL: vi.fn(),
 }));
 
-import { createSession, resumeSession } from '@letta-ai/letta-code-sdk';
+import { createSession, resumeSession } from '../letta/index.js';
 import { LettaBot } from './bot.js';
 
 describe('SDK session contract', () => {

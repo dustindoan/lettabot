@@ -71,6 +71,40 @@ export interface AgentConfig {
   integrations?: {
     google?: GoogleConfig;
   };
+  /** Multi-tenant configuration */
+  tenancy?: {
+    mode: 'single' | 'multi-user';
+    agentPrefix?: string;
+    perUserBlockLabels?: string[];
+    heartbeat?: {
+      enabled: boolean;
+      intervalMin?: number;
+      activeWindowHours?: number;
+      prompt?: string;
+      promptFile?: string;
+    };
+    compaction?: {
+      model?: string;                       // Summarizer model (default: same as agent model)
+      mode?: 'all' | 'sliding_window';      // default: sliding_window
+      clipChars?: number;                    // default: 50000
+      slidingWindowPercentage?: number;      // default: 0.3
+    };
+    mcpServers?: Array<{
+      name: string;                         // e.g. "strava", "google-calendar"
+      url: string;                          // e.g. "http://localhost:3001/mcp"
+      type?: 'sse' | 'streamable_http';     // default: streamable_http
+      customHeaders?: Record<string, string>; // e.g. { "X-User-Id": "{{ LETTA_USER_ID }}" }
+      allowedTools?: string[];              // whitelist — only these tools get attached
+      excludeTools?: string[];              // blacklist — all tools EXCEPT these
+    }>;
+    narrator?: {
+      enabled: boolean;                      // Enable the Narrator (coaching philosophy synthesis)
+      intervalMin?: number;                  // Scheduled synthesis interval in minutes (default: 1440 = daily)
+      conversationThreshold?: number;        // Trigger synthesis after N conversations (0 = disabled, default: 0)
+      minIntervalMin?: number;               // Minimum minutes between synthesis runs (default: 60)
+      context?: string;                      // Extra context included in every synthesis prompt
+    };
+  };
 }
 
 export interface LettaBotConfig {
@@ -163,6 +197,41 @@ export interface LettaBotConfig {
     port?: number;       // Default: 8080 (or PORT env var)
     host?: string;       // Default: 127.0.0.1 (secure). Use '0.0.0.0' for Docker/Railway
     corsOrigin?: string; // CORS origin. Default: same-origin only
+  };
+
+  // Multi-tenant configuration
+  tenancy?: {
+    mode: 'single' | 'multi-user';          // default: 'single'
+    agentPrefix?: string;                    // prefix for auto-created agents (default: agent name)
+    perUserBlockLabels?: string[];           // which .mdx blocks are per-user (default: 'human/*')
+    heartbeat?: {
+      enabled: boolean;
+      intervalMin?: number;                  // default: 60
+      activeWindowHours?: number;            // only heartbeat users active within this window (default: 24)
+      prompt?: string;
+      promptFile?: string;
+    };
+    compaction?: {
+      model?: string;                        // Summarizer model (default: same as agent model)
+      mode?: 'all' | 'sliding_window';       // default: sliding_window
+      clipChars?: number;                    // default: 50000
+      slidingWindowPercentage?: number;      // default: 0.3
+    };
+    mcpServers?: Array<{
+      name: string;                          // e.g. "strava", "google-calendar"
+      url: string;                           // e.g. "http://localhost:3001/mcp"
+      type?: 'sse' | 'streamable_http';      // default: streamable_http
+      customHeaders?: Record<string, string>; // e.g. { "X-User-Id": "{{ LETTA_USER_ID }}" }
+      allowedTools?: string[];               // whitelist — only these tools get attached
+      excludeTools?: string[];               // blacklist — all tools EXCEPT these
+    }>;
+    narrator?: {
+      enabled: boolean;                      // Enable the Narrator (coaching philosophy synthesis)
+      intervalMin?: number;                  // Scheduled synthesis interval in minutes (default: 1440 = daily)
+      conversationThreshold?: number;        // Trigger synthesis after N conversations (0 = disabled, default: 0)
+      minIntervalMin?: number;               // Minimum minutes between synthesis runs (default: 60)
+      context?: string;                      // Extra context included in every synthesis prompt
+    };
   };
 }
 
@@ -552,5 +621,6 @@ export function normalizeAgents(config: LettaBotConfig): AgentConfig[] {
     features: config.features,
     polling: config.polling,
     integrations: config.integrations,
+    tenancy: config.tenancy,
   }];
 }

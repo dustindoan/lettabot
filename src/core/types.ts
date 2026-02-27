@@ -37,6 +37,9 @@ export interface TriggerContext {
     channel: string;
     chatId: string;
   };
+
+  // Multi-tenant: which user's agent to target (for heartbeat/cron)
+  targetChatId?: string;
 }
 
 // =============================================================================

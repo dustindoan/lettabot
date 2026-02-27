@@ -4,7 +4,7 @@
  * Single agent, single conversation - chat continues across all channels.
  */
 
-import { createAgent, createSession, resumeSession, imageFromFile, imageFromURL, type Session, type MessageContentItem, type SendMessage, type CanUseToolCallback } from '@letta-ai/letta-code-sdk';
+import { createAgent, createSession, resumeSession, imageFromFile, imageFromURL, type Session, type MessageContentItem, type SendMessage, type CanUseToolCallback } from '../letta/index.js';
 import { mkdirSync } from 'node:fs';
 import type { ChannelAdapter } from '../channels/types.js';
 import type { BotConfig, InboundMessage, TriggerContext } from './types.js';
@@ -361,10 +361,8 @@ export class LettaBot implements AgentSession {
       : this.store.getConversationId(key);
 
     if (convId) {
-      process.env.LETTA_AGENT_ID = this.store.agentId || undefined;
       session = resumeSession(convId, opts);
     } else if (this.store.agentId) {
-      process.env.LETTA_AGENT_ID = this.store.agentId;
       session = createSession(this.store.agentId, opts);
     } else {
       // Create new agent -- persist immediately so we don't orphan it on later failures
@@ -385,10 +383,10 @@ export class LettaBot implements AgentSession {
       session = createSession(newAgentId, opts);
     }
 
-    // Initialize eagerly so the subprocess is ready before the first send()
-    console.log(`[Bot] Initializing session subprocess (key=${key})...`);
+    // Initialize eagerly so the conversation is created before the first send()
+    console.log(`[Bot] Initializing session (key=${key})...`);
     await session.initialize();
-    console.log(`[Bot] Session subprocess ready (key=${key})`);
+    console.log(`[Bot] Session ready (key=${key})`);
     this.sessions.set(key, session);
     return session;
   }
@@ -1109,7 +1107,11 @@ export class LettaBot implements AgentSession {
           
           if (streamMsg.type === 'result') {
             const resultText = typeof streamMsg.result === 'string' ? streamMsg.result : '';
-            if (resultText.trim().length > 0) {
+            // Only use resultText as fallback when we haven't already streamed content.
+            // Letta concatenates all assistant messages into one result string, which
+            // would overwrite the current (correct) response buffer and cause duplicates
+            // when multi-turn responses have already been finalized and sent.
+            if (resultText.trim().length > 0 && !sentAnyMessage && !response.trim()) {
               response = resultText;
             }
             const hasResponse = response.trim().length > 0;

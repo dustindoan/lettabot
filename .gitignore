@@ -35,8 +35,16 @@ cron-log.jsonl
 cron-jobs.json
 lettabot-agent.json
 lettabot-api.json
+multi-tenant-users.json
+multi-tenant-shared-blocks.json
+narrator-state.json
+narrator-uploads.json
 PERSONA.md
 CLAUDE.md
+
+# Working directories
+todos/
+reference/
 
 # Related repos
 moltbot/

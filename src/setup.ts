@@ -156,13 +156,13 @@ WORKING_DIR=${config.workingDir || '/tmp/lettabot'}
     s.stop('Could not validate Telegram token (network error)');
   }
   
-  // Check Letta CLI (installed via @letta-ai/letta-code-sdk dependency chain)
-  s.start('Checking Letta Code CLI...');
+  // Check Letta client library
+  s.start('Checking Letta client...');
   try {
-    require.resolve('@letta-ai/letta-code/letta.js');
-    s.stop('Letta Code CLI found');
+    require.resolve('@letta-ai/letta-client');
+    s.stop('Letta client found');
   } catch {
-    s.stop('Letta Code CLI not found');
+    s.stop('Letta client not found');
     p.log.warn('Try running: npm install');
   }
   

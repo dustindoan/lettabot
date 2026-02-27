@@ -469,11 +469,154 @@ async function main() {
       break;
     }
       
+    case 'reset-social-self': {
+      const p = await import('@clack/prompts');
+
+      const hard = args.includes('--hard');
+      const chatIdArg = args.find(a => a !== 'reset-social-self' && !a.startsWith('--'));
+
+      p.intro(hard ? 'Hard Delete Social-Self' : 'Reset Social-Self');
+
+      // Load registry directly from JSON (CLI doesn't have a running UserRegistry instance)
+      const registryPath = resolve(getDataDir(), 'multi-tenant-users.json');
+      if (!existsSync(registryPath)) {
+        p.log.error('No user registry found. Run the server first to create agents.');
+        break;
+      }
+
+      const registryData = JSON.parse(readFileSync(registryPath, 'utf-8')) as {
+        version: number;
+        sharedBlockIds: string[];
+        users: Record<string, import('./multi-tenant/types.js').UserRecord>;
+      };
+
+      const userEntries = Object.entries(registryData.users);
+      if (userEntries.length === 0) {
+        p.log.info('No social-selves registered.');
+        break;
+      }
+
+      // Select user
+      let selectedChatId: string;
+      if (chatIdArg && registryData.users[chatIdArg]) {
+        selectedChatId = chatIdArg;
+      } else {
+        if (chatIdArg) {
+          p.log.warn(`No social-self found for "${chatIdArg}".`);
+        }
+        const choice = await p.select({
+          message: 'Which social-self?',
+          options: userEntries.map(([chatId, rec]) => ({
+            label: rec.displayName || chatId,
+            value: chatId,
+            hint: `${rec.channel} · agent=${rec.agentId.slice(0, 20)}… · last active ${rec.lastActiveAt?.slice(0, 10) || 'unknown'}`,
+          })),
+        });
+        if (p.isCancel(choice)) { p.cancel('Cancelled'); break; }
+        selectedChatId = choice as string;
+      }
+
+      const user = registryData.users[selectedChatId];
+      p.log.message('');
+      p.log.message(`  Chat ID:    ${user.chatId}`);
+      p.log.message(`  Name:       ${user.displayName || '(unknown)'}`);
+      p.log.message(`  Agent:      ${user.agentId}`);
+      p.log.message(`  Channel:    ${user.channel}`);
+      p.log.message(`  Letta User: ${user.lettaUserId || '(none)'}`);
+      p.log.message(`  Conv ID:    ${user.conversationId || '(none)'}`);
+      p.log.message('');
+
+      if (hard) {
+        // ── Hard delete ──
+        p.log.warn('HARD DELETE: This permanently destroys the agent and all its data on the Letta server.');
+        const confirmed = await p.confirm({
+          message: 'Permanently delete this social-self?',
+          initialValue: false,
+        });
+        if (!confirmed || p.isCancel(confirmed)) { p.cancel('Cancelled'); break; }
+
+        const { deleteAgent, deleteLettaUser } = await import('./tools/letta-api.js');
+
+        // Delete agent from Letta
+        try {
+          await deleteAgent(user.agentId);
+          p.log.success(`Deleted agent ${user.agentId}`);
+        } catch (err) {
+          p.log.error(`Failed to delete agent: ${err instanceof Error ? err.message : err}`);
+        }
+
+        // Delete Letta user (for OAuth cleanup)
+        if (user.lettaUserId) {
+          try {
+            await deleteLettaUser(user.lettaUserId);
+            p.log.success(`Deleted Letta user ${user.lettaUserId}`);
+          } catch (err) {
+            p.log.warn(`Failed to delete Letta user (may not exist): ${err instanceof Error ? err.message : err}`);
+          }
+        }
+
+        // Remove from registry
+        delete registryData.users[selectedChatId];
+        writeFileSync(registryPath, JSON.stringify(registryData, null, 2));
+        p.log.success('Removed from registry');
+
+        p.outro('Social-self permanently deleted. Next message from this user will create a fresh agent.');
+
+      } else {
+        // ── Soft reset ──
+        p.log.message('This will:');
+        p.log.message('  • Clear the conversation (new message thread)');
+        p.log.message('  • Reset human/* memory blocks to defaults');
+        p.log.message('  • Keep the agent, shared coaching blocks, and OAuth state');
+
+        const confirmed = await p.confirm({
+          message: 'Reset this social-self?',
+          initialValue: true,
+        });
+        if (!confirmed || p.isCancel(confirmed)) { p.cancel('Cancelled'); break; }
+
+        const { listAgentCoreBlocks, updateBlock } = await import('./tools/letta-api.js');
+        const { getPerUserBlocks } = await import('./multi-tenant/shared-blocks.js');
+
+        // 1. Clear conversation
+        user.conversationId = undefined;
+        writeFileSync(registryPath, JSON.stringify(registryData, null, 2));
+        p.log.success('Conversation cleared');
+
+        // 2. Reset human/* blocks to .mdx defaults
+        try {
+          const agentBlocks = await listAgentCoreBlocks(user.agentId);
+          const humanBlocks = agentBlocks.filter(b => b.label.startsWith('human/'));
+
+          // Load fresh templates — agentPrefix used for {{AGENT_NAME}} in .mdx templates
+          const agentConf = config.agents?.[0];
+          const agentPrefix = agentConf?.tenancy?.agentPrefix || agentConf?.name || config.agent?.name || 'lettabot';
+          const templates = getPerUserBlocks(agentPrefix);
+          const templateMap = new Map(templates.map(t => [t.label, t.value]));
+
+          let resetCount = 0;
+          for (const block of humanBlocks) {
+            const defaultValue = templateMap.get(block.label) || '';
+            await updateBlock(block.id, { value: defaultValue });
+            resetCount++;
+          }
+
+          p.log.success(`Reset ${resetCount} human/* block(s) to defaults`);
+        } catch (err) {
+          p.log.error(`Failed to reset memory blocks: ${err instanceof Error ? err.message : err}`);
+          p.log.message('Conversation was still cleared — the agent will start a new conversation but retain old memory.');
+        }
+
+        p.outro('Social-self reset. Restart the server — next message creates a fresh conversation.');
+      }
+      break;
+    }
+
     case 'logout': {
       const { revokeToken } = await import('./auth/oauth.js');
       const { loadTokens, deleteTokens } = await import('./auth/tokens.js');
       const p = await import('@clack/prompts');
-      
+
       p.intro('Logout from Letta Platform');
       
       const tokens = loadTokens();

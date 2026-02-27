@@ -684,6 +684,637 @@ export async function recoverOrphanedConversationApproval(
   }
 }
 
+// ============================================================================
+// Multi-Tenant Helpers
+// ============================================================================
+
+/**
+ * Create a standalone block on the Letta server.
+ * Used for shared blocks (persona, coaching philosophy) that are attached
+ * by reference to multiple agents.
+ */
+export async function createBlock(params: {
+  label: string;
+  value: string;
+  limit?: number;
+  description?: string;
+}): Promise<string> {
+  const client = getClient();
+  const block = await client.blocks.create({
+    label: params.label,
+    value: params.value,
+    limit: params.limit,
+    description: params.description,
+  });
+  return block.id;
+}
+
+/**
+ * Compaction settings for context window summarization.
+ * Passed to agent create/update calls.
+ */
+export interface CompactionConfig {
+  model: string;                          // Required: provider/model-name
+  mode?: 'all' | 'sliding_window';       // Default: sliding_window
+  clip_chars?: number;                    // Default: 50000
+  sliding_window_percentage?: number;     // Default: 0.3 (keep 70%, evict 30%)
+  prompt?: string;
+}
+
+/**
+ * Create a new agent with shared blocks (by reference) and per-user memory blocks.
+ * Shared blocks are attached via block_ids — updating one updates all agents.
+ * Per-user blocks are created as copies via memory_blocks.
+ */
+export async function createAgentWithBlocks(params: {
+  name: string;
+  system: string;
+  model: string;
+  blockIds: string[];
+  memoryBlocks: Array<{ label: string; value: string; limit?: number; description?: string }>;
+  compaction?: CompactionConfig;
+  toolRules?: Array<{ tool_name: string; type?: string }>;
+}): Promise<string> {
+  const client = getClient();
+
+  const createParams: Parameters<typeof client.agents.create>[0] = {
+    name: params.name,
+    system: params.system,
+    model: params.model,
+    block_ids: params.blockIds,
+    memory_blocks: params.memoryBlocks.map(b => ({
+      label: b.label,
+      value: b.value,
+      limit: b.limit,
+      description: b.description,
+    })),
+    include_base_tools: true,
+  };
+
+  if (params.compaction) {
+    createParams.compaction_settings = {
+      model: params.compaction.model,
+      mode: params.compaction.mode,
+      clip_chars: params.compaction.clip_chars,
+      sliding_window_percentage: params.compaction.sliding_window_percentage,
+      prompt: params.compaction.prompt,
+    };
+  }
+
+  if (params.toolRules && params.toolRules.length > 0) {
+    createParams.tool_rules = params.toolRules as Parameters<typeof client.agents.create>[0]['tool_rules'];
+  }
+
+  const agent = await client.agents.create(createParams);
+  return agent.id;
+}
+
+/**
+ * Update compaction settings on an existing agent.
+ */
+export async function updateAgentCompaction(agentId: string, compaction: CompactionConfig): Promise<boolean> {
+  try {
+    const client = getClient();
+    await client.agents.update(agentId, {
+      compaction_settings: {
+        model: compaction.model,
+        mode: compaction.mode,
+        clip_chars: compaction.clip_chars,
+        sliding_window_percentage: compaction.sliding_window_percentage,
+        prompt: compaction.prompt,
+      },
+    });
+    console.log(`[Letta API] Updated compaction settings for agent ${agentId}`);
+    return true;
+  } catch (e) {
+    console.error('[Letta API] Failed to update compaction settings:', e);
+    return false;
+  }
+}
+
+// ============================================================================
+// MCP Server Management
+// ============================================================================
+
+export interface McpServerConfig {
+  name: string;
+  url: string;
+  type?: 'sse' | 'streamable_http';  // default: streamable_http
+  customHeaders?: Record<string, string>;  // e.g. { "X-User-Id": "{{ LETTA_USER_ID }}" }
+}
+
+/**
+ * Register an MCP server with Letta (idempotent — skips if name already exists).
+ * Returns the server ID and list of tool IDs from the server.
+ */
+export async function ensureMcpServer(config: McpServerConfig): Promise<{
+  serverId: string;
+  toolIds: string[];
+  toolNames: string[];
+}> {
+  const client = getClient();
+
+  // Check if already registered
+  const existing = await client.mcpServers.list();
+  const found = existing.find(s => s.server_name === config.name);
+  if (found && found.id) {
+    // Refresh tools to pick up any changes
+    try { await client.mcpServers.refresh(found.id); } catch { /* ignore */ }
+    const tools = await getMcpServerTools(found.id);
+    console.log(`[Letta API] MCP server "${config.name}" already registered (${found.id}), ${tools.length} tool(s)`);
+    return { serverId: found.id, toolIds: tools.map(t => t.id), toolNames: tools.map(t => t.name) };
+  }
+
+  // Register new server
+  const serverType = config.type || 'streamable_http';
+
+  const createConfig: Record<string, unknown> = {
+    server_url: config.url,
+    mcp_server_type: serverType,
+  };
+  if (config.customHeaders && Object.keys(config.customHeaders).length > 0) {
+    createConfig.custom_headers = config.customHeaders;
+  }
+
+  const server = await client.mcpServers.create({
+    server_name: config.name,
+    config: createConfig as { server_url: string; mcp_server_type: 'sse' | 'streamable_http' },
+  });
+
+  const serverId = server.id || '';
+  const tools = await getMcpServerTools(serverId);
+  console.log(`[Letta API] Registered MCP server "${config.name}" (${serverId}), ${tools.length} tool(s)`);
+  return { serverId, toolIds: tools.map(t => t.id), toolNames: tools.map(t => t.name) };
+}
+
+/**
+ * Get tools from an MCP server.
+ */
+export async function getMcpServerTools(serverId: string): Promise<Array<{ id: string; name: string }>> {
+  try {
+    const client = getClient();
+    const tools = await client.mcpServers.tools.list(serverId);
+    return tools.map(t => ({ id: t.id, name: t.name ?? 'unknown' }));
+  } catch (e) {
+    console.error(`[Letta API] Failed to list MCP server tools:`, e);
+    return [];
+  }
+}
+
+/**
+ * Filter MCP tool IDs/names by an allowlist or excludelist.
+ *
+ * - If `allowedTools` is provided, only tools whose name is in the list are kept.
+ * - Else if `excludeTools` is provided, tools whose name is in the list are removed.
+ * - If neither is provided, all tools are returned unchanged.
+ */
+export function filterMcpTools(
+  toolIds: string[],
+  toolNames: string[],
+  allowedTools?: string[],
+  excludeTools?: string[],
+): { toolIds: string[]; toolNames: string[] } {
+  const pairs = toolIds.map((id, i) => ({ id, name: toolNames[i] }));
+
+  if (allowedTools && allowedTools.length > 0) {
+    const allowed = new Set(allowedTools);
+    const filtered = pairs.filter(p => allowed.has(p.name));
+    const missing = allowedTools.filter(t => !pairs.some(p => p.name === t));
+    if (missing.length > 0) {
+      console.warn(`[MCP Filter] allowedTools not found on server: ${missing.join(', ')}`);
+    }
+    return { toolIds: filtered.map(p => p.id), toolNames: filtered.map(p => p.name) };
+  }
+
+  if (excludeTools && excludeTools.length > 0) {
+    const excluded = new Set(excludeTools);
+    const filtered = pairs.filter(p => !excluded.has(p.name));
+    return { toolIds: filtered.map(p => p.id), toolNames: filtered.map(p => p.name) };
+  }
+
+  return { toolIds, toolNames };
+}
+
+/**
+ * Attach multiple tools to an agent (idempotent — skips already-attached tools).
+ */
+export async function attachToolsToAgent(agentId: string, toolIds: string[]): Promise<number> {
+  const client = getClient();
+  const existingTools = await getAgentTools(agentId);
+  const existingIds = new Set(existingTools.map(t => t.id));
+
+  let attached = 0;
+  for (const toolId of toolIds) {
+    if (existingIds.has(toolId)) continue;
+    try {
+      await client.agents.tools.attach(toolId, { agent_id: agentId });
+      attached++;
+    } catch (e) {
+      console.warn(`[Letta API] Failed to attach tool ${toolId} to agent ${agentId}:`, e);
+    }
+  }
+
+  if (attached > 0) {
+    console.log(`[Letta API] Attached ${attached} tool(s) to agent ${agentId}`);
+  }
+  return attached;
+}
+
+// ============================================================================
+// User Management
+// ============================================================================
+
+const DEFAULT_ORG_ID = 'org-00000000-0000-4000-8000-000000000000';
+
+/**
+ * Create a Letta user for per-user MCP OAuth scoping.
+ * Uses the REST API directly since the TS SDK doesn't expose the users endpoint.
+ * Returns the new user's ID (e.g. "user-<uuid>").
+ */
+export async function createLettaUser(name: string): Promise<string> {
+  const baseUrl = LETTA_BASE_URL.replace(/\/+$/, '');
+  const apiKey = process.env.LETTA_API_KEY || '';
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Letta-Source': 'lettabot',
+  };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const resp = await fetch(`${baseUrl}/v1/admin/users/`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ name, organization_id: DEFAULT_ORG_ID }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Failed to create Letta user "${name}": ${resp.status} ${text}`);
+  }
+
+  const user = await resp.json() as { id: string };
+  console.log(`[Letta API] Created Letta user "${name}" → ${user.id}`);
+  return user.id;
+}
+
+/**
+ * Delete a Letta agent permanently.
+ * This removes the agent and all its conversations from the server.
+ */
+export async function deleteAgent(agentId: string): Promise<void> {
+  const client = getClient();
+  await client.agents.delete(agentId);
+  console.log(`[Letta API] Deleted agent ${agentId}`);
+}
+
+/**
+ * Delete a Letta user. Used when hard-deleting a social-self to clean up
+ * the per-user OAuth scoping identity.
+ * Uses the REST API directly since the TS SDK doesn't expose admin user deletion.
+ */
+export async function deleteLettaUser(userId: string): Promise<void> {
+  const baseUrl = LETTA_BASE_URL.replace(/\/+$/, '');
+  const apiKey = process.env.LETTA_API_KEY || '';
+
+  const headers: Record<string, string> = {
+    'X-Letta-Source': 'lettabot',
+  };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const resp = await fetch(`${baseUrl}/v1/admin/users/${userId}`, {
+    method: 'DELETE',
+    headers,
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Failed to delete Letta user ${userId}: ${resp.status} ${text}`);
+  }
+
+  console.log(`[Letta API] Deleted Letta user ${userId}`);
+}
+
+/**
+ * Set secrets (encrypted env vars) on an agent.
+ * Used for per-agent identity (e.g., LETTA_USER_ID for MCP OAuth scoping).
+ * Template variables like {{ LETTA_USER_ID }} in MCP server custom_headers
+ * are resolved from these secrets at tool execution time.
+ */
+export async function setAgentSecrets(
+  agentId: string,
+  secrets: Record<string, string>,
+): Promise<boolean> {
+  try {
+    const client = getClient();
+    await client.agents.update(agentId, { secrets });
+    console.log(`[Letta API] Set ${Object.keys(secrets).length} secret(s) on agent ${agentId}`);
+    return true;
+  } catch (e) {
+    console.error(`[Letta API] Failed to set secrets on agent ${agentId}:`, e);
+    return false;
+  }
+}
+
+// ============================================================================
+// Narrator / Block Management
+// ============================================================================
+
+export interface BlockInfo {
+  id: string;
+  label: string;
+  value: string;
+  limit: number;
+  description?: string;
+}
+
+/**
+ * Get a block by ID.
+ */
+export async function getBlock(blockId: string): Promise<BlockInfo> {
+  const client = getClient();
+  const block = await client.blocks.retrieve(blockId);
+  return {
+    id: block.id,
+    label: block.label ?? '',
+    value: block.value ?? '',
+    limit: block.limit ?? 5000,
+    description: block.description ?? undefined,
+  };
+}
+
+/**
+ * Update a block's value (and optionally description/limit).
+ */
+export async function updateBlock(blockId: string, updates: {
+  value?: string;
+  description?: string;
+  limit?: number;
+}): Promise<BlockInfo> {
+  const client = getClient();
+  const block = await client.blocks.update(blockId, updates);
+  return {
+    id: block.id,
+    label: block.label ?? '',
+    value: block.value ?? '',
+    limit: block.limit ?? 5000,
+    description: block.description ?? undefined,
+  };
+}
+
+/**
+ * List all core memory blocks for an agent.
+ */
+export async function listAgentCoreBlocks(agentId: string): Promise<BlockInfo[]> {
+  const client = getClient();
+  const page = await client.agents.blocks.list(agentId);
+  const blocks: BlockInfo[] = [];
+  for await (const block of page) {
+    blocks.push({
+      id: block.id,
+      label: block.label ?? '',
+      value: block.value ?? '',
+      limit: block.limit ?? 5000,
+      description: block.description ?? undefined,
+    });
+  }
+  return blocks;
+}
+
+/**
+ * Attach a block to an agent by ID (idempotent).
+ */
+export async function attachBlockToAgent(agentId: string, blockId: string): Promise<void> {
+  const client = getClient();
+  try {
+    await client.agents.blocks.attach(blockId, { agent_id: agentId });
+  } catch (e) {
+    // Ignore if already attached
+    const err = e as { status?: number };
+    if (err.status !== 409) throw e;
+  }
+}
+
+/**
+ * Send a message to an agent (non-streaming). Returns the agent's text response.
+ */
+export async function sendAgentMessage(agentId: string, message: string): Promise<string> {
+  const client = getClient();
+  const response = await client.agents.messages.create(agentId, {
+    messages: [{ role: 'user', content: message }],
+    streaming: false,
+  });
+
+  // Extract text from response messages
+  const texts: string[] = [];
+  const messages = (response as { messages?: Array<{ message_type?: string; content?: string }> }).messages || [];
+  for (const msg of messages) {
+    if (msg.message_type === 'assistant_message' && msg.content) {
+      texts.push(msg.content);
+    }
+  }
+  return texts.join('\n');
+}
+
+/**
+ * Create a custom tool from Python source code.
+ * Returns the tool ID. Idempotent via upsert.
+ */
+export async function upsertToolFromSource(params: {
+  source_code: string;
+  description?: string;
+  tags?: string[];
+}): Promise<{ id: string; name: string }> {
+  const client = getClient();
+  const tool = await client.tools.upsert({
+    source_code: params.source_code,
+    description: params.description,
+    tags: params.tags,
+  });
+  return { id: tool.id, name: tool.name ?? 'unknown' };
+}
+
+// ============================================================================
+// Folder / File Management (for reference material)
+// ============================================================================
+
+/**
+ * Create a folder (source container) for reference material.
+ * Returns the folder ID.
+ */
+export async function createFolder(name: string, description?: string): Promise<string> {
+  const baseUrl = LETTA_BASE_URL.replace(/\/+$/, '');
+  const apiKey = process.env.LETTA_API_KEY || '';
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-Letta-Source': 'lettabot',
+  };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  // Use Ollama nomic-embed-text for embeddings (local, free)
+  const ollamaBase = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
+  const embeddingConfig: Record<string, unknown> = {
+    handle: 'ollama/nomic-embed-text',
+    provider_name: 'ollama',
+    embedding_endpoint_type: 'openai',
+    embedding_endpoint: `${ollamaBase}/v1/`,
+    embedding_model: 'nomic-embed-text',
+    embedding_dim: 768,
+    embedding_chunk_size: 300,
+    batch_size: 32,
+  };
+
+  const body: Record<string, unknown> = { name, description };
+  if (embeddingConfig) {
+    body.embedding_config = embeddingConfig;
+  }
+
+  const resp = await fetch(`${baseUrl}/v1/folders/`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Failed to create folder "${name}": ${resp.status} ${text}`);
+  }
+
+  const folder = await resp.json() as { id: string };
+  console.log(`[Letta API] Created folder "${name}" → ${folder.id}`);
+  return folder.id;
+}
+
+/**
+ * Find a folder by name (returns first match, or null).
+ */
+export async function findFolderByName(name: string): Promise<string | null> {
+  const baseUrl = LETTA_BASE_URL.replace(/\/+$/, '');
+  const apiKey = process.env.LETTA_API_KEY || '';
+
+  const headers: Record<string, string> = {
+    'X-Letta-Source': 'lettabot',
+  };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const resp = await fetch(`${baseUrl}/v1/folders/`, { method: 'GET', headers });
+  if (!resp.ok) return null;
+
+  const folders = await resp.json() as Array<{ id: string; name: string }>;
+  const match = folders.find(f => f.name === name);
+  return match?.id ?? null;
+}
+
+/**
+ * Upload a file to a folder. Letta auto-chunks, embeds, and indexes.
+ */
+export async function uploadFileToFolder(folderId: string, filePath: string, fileName: string): Promise<void> {
+  const { readFileSync } = await import('node:fs');
+  const baseUrl = LETTA_BASE_URL.replace(/\/+$/, '');
+  const apiKey = process.env.LETTA_API_KEY || '';
+
+  const fileBuffer = readFileSync(filePath);
+  const formData = new FormData();
+  formData.append('file', new Blob([fileBuffer]), fileName);
+
+  const headers: Record<string, string> = {
+    'X-Letta-Source': 'lettabot',
+  };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const resp = await fetch(`${baseUrl}/v1/folders/${folderId}/upload`, {
+    method: 'POST',
+    headers,
+    body: formData,
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Failed to upload "${fileName}" to folder ${folderId}: ${resp.status} ${text}`);
+  }
+
+  console.log(`[Letta API] Uploaded "${fileName}" to folder ${folderId}`);
+}
+
+/**
+ * Attach a folder to an agent so it can search the folder's documents.
+ */
+export async function attachFolderToAgent(agentId: string, folderId: string): Promise<void> {
+  const baseUrl = LETTA_BASE_URL.replace(/\/+$/, '');
+  const apiKey = process.env.LETTA_API_KEY || '';
+
+  const headers: Record<string, string> = {
+    'X-Letta-Source': 'lettabot',
+  };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const resp = await fetch(`${baseUrl}/v1/agents/${agentId}/folders/attach/${folderId}`, {
+    method: 'PATCH',
+    headers,
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Failed to attach folder ${folderId} to agent ${agentId}: ${resp.status} ${text}`);
+  }
+
+  console.log(`[Letta API] Attached folder ${folderId} to agent ${agentId}`);
+}
+
+/**
+ * List files in a folder.
+ */
+export async function listFolderFiles(folderId: string): Promise<Array<{ id: string; file_name: string }>> {
+  const baseUrl = LETTA_BASE_URL.replace(/\/+$/, '');
+  const apiKey = process.env.LETTA_API_KEY || '';
+
+  const headers: Record<string, string> = {
+    'X-Letta-Source': 'lettabot',
+  };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
+  const resp = await fetch(`${baseUrl}/v1/folders/${folderId}/files`, {
+    method: 'GET',
+    headers,
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Failed to list files in folder ${folderId}: ${resp.status} ${text}`);
+  }
+
+  return (await resp.json()) as Array<{ id: string; file_name: string }>;
+}
+
+/**
+ * List agent messages (conversation history).
+ */
+export async function listAgentMessages(agentId: string, limit = 200): Promise<Array<{
+  message_type: string;
+  content?: string;
+  created_at?: string;
+  role?: string;
+}>> {
+  const client = getClient();
+  const page = await client.agents.messages.list(agentId, { limit });
+  const messages: Array<{
+    message_type: string;
+    content?: string;
+    created_at?: string;
+    role?: string;
+  }> = [];
+  for await (const msg of page) {
+    const m = msg as unknown as Record<string, unknown>;
+    messages.push({
+      message_type: (m.message_type as string) || 'unknown',
+      content: (m.content as string) || undefined,
+      created_at: (m.created_at as string) || undefined,
+      role: (m.role as string) || undefined,
+    });
+  }
+  return messages;
+}
+
 export async function disableAllToolApprovals(agentId: string): Promise<number> {
   try {
     const tools = await getAgentTools(agentId);

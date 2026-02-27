@@ -1,8 +1,8 @@
-import type { AnyAgentTool } from '@letta-ai/letta-code-sdk';
+import type { AnyAgentTool } from '../letta/index.js';
 import {
   jsonResult,
   readStringParam,
-} from '@letta-ai/letta-code-sdk';
+} from '../letta/index.js';
 import {
   addTodo,
   completeTodo,

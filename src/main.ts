@@ -166,7 +166,16 @@ import { collectGroupBatchingConfig } from './core/group-batching-config.js';
 import { CronService } from './cron/service.js';
 import { HeartbeatService } from './cron/heartbeat.js';
 import { PollingService, parseGmailAccounts } from './polling/service.js';
-import { agentExists, findAgentByName, ensureNoToolApprovals } from './tools/letta-api.js';
+import { agentExists, findAgentByName, ensureNoToolApprovals, updateAgentCompaction, ensureMcpServer, attachToolsToAgent, filterMcpTools, type CompactionConfig } from './tools/letta-api.js';
+// Multi-tenant imports
+import { MultiTenantBot } from './multi-tenant/multi-tenant-bot.js';
+import { MultiTenantHeartbeatService } from './multi-tenant/heartbeat.js';
+import { UserRegistry } from './multi-tenant/user-registry.js';
+import { ensureSharedBlocks } from './multi-tenant/shared-blocks.js';
+// Narrator imports
+import { ensureNarrator, ingestReferenceFiles, NarratorScheduler } from './narrator/index.js';
+// Assess tool imports
+import { ensureAssessTool, buildAssessToolRules } from './tools/assess.js';
 // Skills are now installed to agent-scoped location after agent creation (see bot.ts)
 
 // Check if config exists (skip in Railway/Docker where env vars are used directly)
@@ -516,147 +525,350 @@ async function main() {
     groupBatchers: [],
   };
   
+  // Narrator scheduler — hoisted for API server access
+  let narratorScheduler: NarratorScheduler | undefined;
+
   for (const agentConfig of agents) {
     console.log(`\n[Setup] Configuring agent: ${agentConfig.name}`);
-    
-    // Create LettaBot for this agent
-    const bot = new LettaBot({
-      workingDir: globalConfig.workingDir,
-      agentName: agentConfig.name,
-      allowedTools: globalConfig.allowedTools,
-      disallowedTools: globalConfig.disallowedTools,
-      displayName: agentConfig.displayName,
-      maxToolCalls: agentConfig.features?.maxToolCalls,
-      conversationMode: agentConfig.conversations?.mode || 'shared',
-      heartbeatConversation: agentConfig.conversations?.heartbeat || 'last-active',
-      skills: {
-        cronEnabled: agentConfig.features?.cron ?? globalConfig.cronEnabled,
-        googleEnabled: !!agentConfig.integrations?.google?.enabled || !!agentConfig.polling?.gmail?.enabled,
-      },
-    });
-    
-    // Apply explicit agent ID from config (before store verification)
-    let initialStatus = bot.getStatus();
-    if (agentConfig.id && !initialStatus.agentId) {
-      console.log(`[Agent:${agentConfig.name}] Using configured agent ID: ${agentConfig.id}`);
-      bot.setAgentId(agentConfig.id);
-      initialStatus = bot.getStatus();
-    }
-    
-    // Verify agent exists (clear stale ID if deleted)
-    if (initialStatus.agentId) {
-      const exists = await agentExists(initialStatus.agentId);
-      if (!exists) {
-        console.log(`[Agent:${agentConfig.name}] Stored agent ${initialStatus.agentId} not found on server`);
-        bot.reset();
-        initialStatus = bot.getStatus();
-      }
-    }
 
-    // Container deploy: discover by name
-    if (!initialStatus.agentId && isContainerDeploy) {
-      const found = await findAgentByName(agentConfig.name);
-      if (found) {
-        console.log(`[Agent:${agentConfig.name}] Found existing agent: ${found.id}`);
-        bot.setAgentId(found.id);
-        initialStatus = bot.getStatus();
-      }
-    }
+    const isMultiTenant = agentConfig.tenancy?.mode === 'multi-user';
 
-    if (!initialStatus.agentId) {
-      console.log(`[Agent:${agentConfig.name}] No agent found - will create on first message`);
-    }
-    
-    // Disable tool approvals
-    if (initialStatus.agentId) {
-      ensureNoToolApprovals(initialStatus.agentId).catch(err => {
-        console.warn(`[Agent:${agentConfig.name}] Failed to check tool approvals:`, err);
-      });
-    }
+    if (isMultiTenant) {
+      // =====================================================================
+      // Multi-tenant path: one agent per user
+      // =====================================================================
+      console.log(`[Setup] Multi-tenant mode for ${agentConfig.name}`);
 
-    // Create and register channels
-    const adapters = createChannelsForAgent(agentConfig, attachmentsDir, globalConfig.attachmentsMaxBytes);
-    for (const adapter of adapters) {
-      bot.registerChannel(adapter);
-    }
+      const tenancyConfig = agentConfig.tenancy!;
+      const agentPrefix = tenancyConfig.agentPrefix || agentConfig.name;
+      const model = agentConfig.model || process.env.LETTA_MODEL || 'letta-free';
 
-    // Setup group batching
-    const { batcher, intervals, instantIds, listeningIds } = createGroupBatcher(agentConfig, bot);
-    if (batcher) {
-      bot.setGroupBatcher(batcher, intervals, instantIds, listeningIds);
-      services.groupBatchers.push(batcher);
-    }
+      // Create shared blocks (persona/* — shared by reference across all user agents)
+      const sharedBlockIds = await ensureSharedBlocks(agentPrefix, []);
 
-    // Pre-warm the SDK session subprocess so the first message doesn't pay startup cost
-    bot.warmSession().catch(() => {});
-
-    // Per-agent cron
-    if (agentConfig.features?.cron ?? globalConfig.cronEnabled) {
-      const cronService = new CronService(bot);
-      await cronService.start();
-      services.cronServices.push(cronService);
-    }
-
-    // Per-agent heartbeat
-    const heartbeatConfig = agentConfig.features?.heartbeat;
-    const heartbeatService = new HeartbeatService(bot, {
-      enabled: heartbeatConfig?.enabled ?? false,
-      intervalMinutes: heartbeatConfig?.intervalMin ?? 30,
-      skipRecentUserMinutes: heartbeatConfig?.skipRecentUserMin ?? globalConfig.heartbeatSkipRecentUserMin,
-      agentKey: agentConfig.name,
-      prompt: heartbeatConfig?.prompt || process.env.HEARTBEAT_PROMPT,
-      promptFile: heartbeatConfig?.promptFile,
-      workingDir: globalConfig.workingDir,
-      target: parseHeartbeatTarget(heartbeatConfig?.target) || parseHeartbeatTarget(process.env.HEARTBEAT_TARGET),
-    });
-    if (heartbeatConfig?.enabled) {
-      heartbeatService.start();
-      services.heartbeatServices.push(heartbeatService);
-    }
-    bot.onTriggerHeartbeat = () => heartbeatService.trigger();
-    
-    // Per-agent polling -- resolve accounts from polling > integrations.google (legacy) > env
-    const pollConfig = (() => {
-      const pollingAccounts = parseGmailAccounts(
-        agentConfig.polling?.gmail?.accounts || agentConfig.polling?.gmail?.account
-      );
-      const legacyAccounts = (() => {
-        const legacy = agentConfig.integrations?.google;
-        if (legacy?.accounts?.length) {
-          return parseGmailAccounts(legacy.accounts.map(a => a.account));
-        }
-        return parseGmailAccounts(legacy?.account);
+      // Build compaction config (defaults to using the same model as the agent)
+      const compaction: CompactionConfig | undefined = (() => {
+        const cc = tenancyConfig.compaction;
+        // Always configure compaction — use agent model as default summarizer
+        const compactionModel = cc?.model || model;
+        return {
+          model: compactionModel,
+          mode: cc?.mode || 'sliding_window',
+          clip_chars: cc?.clipChars,
+          sliding_window_percentage: cc?.slidingWindowPercentage,
+        };
       })();
-      const envAccounts = parseGmailAccounts(process.env.GMAIL_ACCOUNT);
-      const gmailAccounts = pollingAccounts.length > 0
-        ? pollingAccounts
-        : legacyAccounts.length > 0
-          ? legacyAccounts
-          : envAccounts;
-      const gmailEnabled = agentConfig.polling?.gmail?.enabled
-        ?? agentConfig.integrations?.google?.enabled
-        ?? gmailAccounts.length > 0;
-      return {
-        enabled: agentConfig.polling?.enabled ?? gmailEnabled,
-        intervalMs: agentConfig.polling?.intervalMs
-          ?? (agentConfig.integrations?.google?.pollIntervalSec
-            ? agentConfig.integrations.google.pollIntervalSec * 1000
-            : 60000),
-        gmail: { enabled: gmailEnabled, accounts: gmailAccounts },
-      };
-    })();
-    
-    if (pollConfig.enabled && pollConfig.gmail.enabled && pollConfig.gmail.accounts.length > 0) {
-      const pollingService = new PollingService(bot, {
-        intervalMs: pollConfig.intervalMs,
-        workingDir: globalConfig.workingDir,
-        gmail: pollConfig.gmail,
+      console.log(`[Setup] Compaction: model=${compaction.model}, mode=${compaction.mode}`);
+
+      // Register MCP servers and collect tool IDs + names
+      const mcpToolIds: string[] = [];
+      const mcpToolNames: string[] = [];
+      if (tenancyConfig.mcpServers?.length) {
+        console.log(`[Setup] Registering ${tenancyConfig.mcpServers.length} MCP server(s)...`);
+        for (const serverConfig of tenancyConfig.mcpServers) {
+          try {
+            const { toolIds, toolNames } = await ensureMcpServer({
+              name: serverConfig.name,
+              url: serverConfig.url,
+              type: serverConfig.type || 'streamable_http',
+              customHeaders: serverConfig.customHeaders,
+            });
+            const filtered = filterMcpTools(toolIds, toolNames, serverConfig.allowedTools, serverConfig.excludeTools);
+            if (filtered.toolIds.length !== toolIds.length) {
+              console.log(`[Setup] ${serverConfig.name}: ${filtered.toolIds.length}/${toolIds.length} tools after filtering`);
+            }
+            mcpToolIds.push(...filtered.toolIds);
+            mcpToolNames.push(...filtered.toolNames);
+          } catch (err) {
+            console.error(`[Setup] Failed to register MCP server "${serverConfig.name}":`, err);
+          }
+        }
+        console.log(`[Setup] Total MCP tools available: ${mcpToolIds.length}`);
+      }
+
+      // Register assess tool (coaching checkpoint — forces structured assessment before every response)
+      let assessToolId: string | undefined;
+      let toolRules: Array<{ tool_name: string; type?: string }> | undefined;
+      try {
+        assessToolId = await ensureAssessTool();
+        toolRules = buildAssessToolRules();
+        console.log(`[Setup] Assess tool registered: ${assessToolId}`);
+      } catch (err) {
+        console.error('[Setup] Failed to register assess tool (non-fatal):', err instanceof Error ? err.message : err);
+      }
+
+      // Create user registry (loads cached users, creates agents on demand)
+      const registry = new UserRegistry({
+        sharedBlockIds,
+        model,
+        agentPrefix,
+        skills: {
+          cronEnabled: agentConfig.features?.cron ?? globalConfig.cronEnabled,
+          googleEnabled: !!agentConfig.integrations?.google?.enabled || !!agentConfig.polling?.gmail?.enabled,
+        },
+        perUserBlockLabels: tenancyConfig.perUserBlockLabels,
+        compaction,
+        mcpToolIds,
+        assessToolId,
+        toolRules,
       });
-      pollingService.start();
-      services.pollingServices.push(pollingService);
+
+      // Patch compaction settings on existing agents (created before compaction was configured)
+      if (compaction && registry.size > 0) {
+        const existingUsers = registry.listAll().filter(u => u.agentId);
+        if (existingUsers.length > 0) {
+          console.log(`[Setup] Patching compaction settings on ${existingUsers.length} existing agent(s)...`);
+          for (const user of existingUsers) {
+            updateAgentCompaction(user.agentId, compaction).catch(err => {
+              console.warn(`[Setup] Failed to patch compaction for agent ${user.agentId}:`, err);
+            });
+          }
+        }
+      }
+
+      // Attach MCP tools to existing agents (ensures all agents have latest MCP tools)
+      if (mcpToolIds.length > 0 && registry.size > 0) {
+        const existingUsers = registry.listAll().filter(u => u.agentId);
+        if (existingUsers.length > 0) {
+          console.log(`[Setup] Attaching MCP tools to ${existingUsers.length} existing agent(s)...`);
+          for (const user of existingUsers) {
+            attachToolsToAgent(user.agentId, mcpToolIds).then(count => {
+              if (count > 0) {
+                console.log(`[Setup] Attached ${count} MCP tool(s) to agent ${user.agentId}`);
+              }
+            }).catch(err => {
+              console.warn(`[Setup] Failed to attach MCP tools to agent ${user.agentId}:`, err);
+            });
+          }
+        }
+      }
+
+      // Setup Narrator agent (coaching philosophy synthesis)
+      const narratorConfig = tenancyConfig.narrator;
+      const narratorEnabled = narratorConfig?.enabled ?? false;
+      if (narratorEnabled) {
+        const referenceDir = resolve(getDataDir(), 'reference');
+        try {
+          const narratorState = await ensureNarrator({
+            lettaBaseUrl: process.env.LETTA_BASE_URL || 'http://localhost:8283',
+            model,
+            compaction,
+          });
+          // Ingest reference material
+          if (narratorState.folderId) {
+            await ingestReferenceFiles(referenceDir, narratorState.folderId);
+          }
+          console.log(`[Setup] Narrator ready: ${narratorState.agentId}`);
+
+          // Create and start the synthesis scheduler
+          narratorScheduler = new NarratorScheduler({
+            enabled: true,
+            intervalMinutes: narratorConfig!.intervalMin ?? 1440,
+            conversationThreshold: narratorConfig!.conversationThreshold ?? 0,
+            minIntervalMinutes: narratorConfig!.minIntervalMin ?? 60,
+            context: narratorConfig!.context,
+          });
+          narratorScheduler.start();
+        } catch (e) {
+          console.error('[Setup] Narrator setup failed (non-fatal):', e instanceof Error ? e.message : e);
+        }
+      }
+
+      // Create MultiTenantBot
+      const bot = new MultiTenantBot({
+        workingDir: globalConfig.workingDir,
+        agentName: agentConfig.name,
+        allowedTools: globalConfig.allowedTools,
+        disallowedTools: globalConfig.disallowedTools,
+        displayName: agentConfig.displayName,
+        maxToolCalls: agentConfig.features?.maxToolCalls,
+        registry,
+      });
+
+      // Create and register channels
+      const adapters = createChannelsForAgent(agentConfig, attachmentsDir, globalConfig.attachmentsMaxBytes);
+      for (const adapter of adapters) {
+        bot.registerChannel(adapter);
+      }
+
+      // Setup group batching
+      const { batcher, intervals, instantIds, listeningIds } = createGroupBatcher(agentConfig, bot);
+      if (batcher) {
+        bot.setGroupBatcher(batcher, intervals, instantIds, listeningIds);
+        services.groupBatchers.push(batcher);
+      }
+
+      // Multi-tenant heartbeat
+      const mtHeartbeatConfig = tenancyConfig.heartbeat;
+      if (mtHeartbeatConfig?.enabled) {
+        const mtHeartbeatService = new MultiTenantHeartbeatService(bot, registry, {
+          enabled: true,
+          intervalMinutes: mtHeartbeatConfig.intervalMin ?? 60,
+          activeWindowHours: mtHeartbeatConfig.activeWindowHours ?? 24,
+          workingDir: globalConfig.workingDir,
+          agentPrefix,
+          prompt: mtHeartbeatConfig.prompt || process.env.HEARTBEAT_PROMPT,
+          promptFile: mtHeartbeatConfig.promptFile,
+          mcpToolNames: mcpToolNames.length > 0 ? mcpToolNames : undefined,
+        });
+        mtHeartbeatService.start();
+        // Store for shutdown (reuse heartbeatServices array — stop() works the same)
+        (services as any).mtHeartbeatServices = (services as any).mtHeartbeatServices || [];
+        (services as any).mtHeartbeatServices.push(mtHeartbeatService);
+        bot.onTriggerHeartbeat = () => mtHeartbeatService.trigger();
+      }
+
+      // Wire Narrator conversation-driven trigger
+      if (narratorScheduler) {
+        bot.onConversationComplete = () => narratorScheduler!.recordConversation();
+      }
+
+      gateway.addAgent(agentConfig.name, bot);
+
+    } else {
+      // =====================================================================
+      // Single-agent path (existing LettaBot — UNCHANGED)
+      // =====================================================================
+
+      // Create LettaBot for this agent
+      const bot = new LettaBot({
+        workingDir: globalConfig.workingDir,
+        agentName: agentConfig.name,
+        allowedTools: globalConfig.allowedTools,
+        disallowedTools: globalConfig.disallowedTools,
+        displayName: agentConfig.displayName,
+        maxToolCalls: agentConfig.features?.maxToolCalls,
+        conversationMode: agentConfig.conversations?.mode || 'shared',
+        heartbeatConversation: agentConfig.conversations?.heartbeat || 'last-active',
+        skills: {
+          cronEnabled: agentConfig.features?.cron ?? globalConfig.cronEnabled,
+          googleEnabled: !!agentConfig.integrations?.google?.enabled || !!agentConfig.polling?.gmail?.enabled,
+        },
+      });
+
+      // Apply explicit agent ID from config (before store verification)
+      let initialStatus = bot.getStatus();
+      if (agentConfig.id && !initialStatus.agentId) {
+        console.log(`[Agent:${agentConfig.name}] Using configured agent ID: ${agentConfig.id}`);
+        bot.setAgentId(agentConfig.id);
+        initialStatus = bot.getStatus();
+      }
+
+      // Verify agent exists (clear stale ID if deleted)
+      if (initialStatus.agentId) {
+        const exists = await agentExists(initialStatus.agentId);
+        if (!exists) {
+          console.log(`[Agent:${agentConfig.name}] Stored agent ${initialStatus.agentId} not found on server`);
+          bot.reset();
+          initialStatus = bot.getStatus();
+        }
+      }
+
+      // Container deploy: discover by name
+      if (!initialStatus.agentId && isContainerDeploy) {
+        const found = await findAgentByName(agentConfig.name);
+        if (found) {
+          console.log(`[Agent:${agentConfig.name}] Found existing agent: ${found.id}`);
+          bot.setAgentId(found.id);
+          initialStatus = bot.getStatus();
+        }
+      }
+
+      if (!initialStatus.agentId) {
+        console.log(`[Agent:${agentConfig.name}] No agent found - will create on first message`);
+      }
+
+      // Disable tool approvals
+      if (initialStatus.agentId) {
+        ensureNoToolApprovals(initialStatus.agentId).catch(err => {
+          console.warn(`[Agent:${agentConfig.name}] Failed to check tool approvals:`, err);
+        });
+      }
+
+      // Create and register channels
+      const adapters = createChannelsForAgent(agentConfig, attachmentsDir, globalConfig.attachmentsMaxBytes);
+      for (const adapter of adapters) {
+        bot.registerChannel(adapter);
+      }
+
+      // Setup group batching
+      const { batcher, intervals, instantIds, listeningIds } = createGroupBatcher(agentConfig, bot);
+      if (batcher) {
+        bot.setGroupBatcher(batcher, intervals, instantIds, listeningIds);
+        services.groupBatchers.push(batcher);
+      }
+
+      // Pre-warm the SDK session subprocess so the first message doesn't pay startup cost
+      bot.warmSession().catch(() => {});
+
+      // Per-agent cron
+      if (agentConfig.features?.cron ?? globalConfig.cronEnabled) {
+        const cronService = new CronService(bot);
+        await cronService.start();
+        services.cronServices.push(cronService);
+      }
+
+      // Per-agent heartbeat
+      const heartbeatConfig = agentConfig.features?.heartbeat;
+      const heartbeatService = new HeartbeatService(bot, {
+        enabled: heartbeatConfig?.enabled ?? false,
+        intervalMinutes: heartbeatConfig?.intervalMin ?? 30,
+        skipRecentUserMinutes: heartbeatConfig?.skipRecentUserMin ?? globalConfig.heartbeatSkipRecentUserMin,
+        agentKey: agentConfig.name,
+        prompt: heartbeatConfig?.prompt || process.env.HEARTBEAT_PROMPT,
+        promptFile: heartbeatConfig?.promptFile,
+        workingDir: globalConfig.workingDir,
+        target: parseHeartbeatTarget(heartbeatConfig?.target) || parseHeartbeatTarget(process.env.HEARTBEAT_TARGET),
+      });
+      if (heartbeatConfig?.enabled) {
+        heartbeatService.start();
+        services.heartbeatServices.push(heartbeatService);
+      }
+      bot.onTriggerHeartbeat = () => heartbeatService.trigger();
+
+      // Per-agent polling -- resolve accounts from polling > integrations.google (legacy) > env
+      const pollConfig = (() => {
+        const pollingAccounts = parseGmailAccounts(
+          agentConfig.polling?.gmail?.accounts || agentConfig.polling?.gmail?.account
+        );
+        const legacyAccounts = (() => {
+          const legacy = agentConfig.integrations?.google;
+          if (legacy?.accounts?.length) {
+            return parseGmailAccounts(legacy.accounts.map(a => a.account));
+          }
+          return parseGmailAccounts(legacy?.account);
+        })();
+        const envAccounts = parseGmailAccounts(process.env.GMAIL_ACCOUNT);
+        const gmailAccounts = pollingAccounts.length > 0
+          ? pollingAccounts
+          : legacyAccounts.length > 0
+            ? legacyAccounts
+            : envAccounts;
+        const gmailEnabled = agentConfig.polling?.gmail?.enabled
+          ?? agentConfig.integrations?.google?.enabled
+          ?? gmailAccounts.length > 0;
+        return {
+          enabled: agentConfig.polling?.enabled ?? gmailEnabled,
+          intervalMs: agentConfig.polling?.intervalMs
+            ?? (agentConfig.integrations?.google?.pollIntervalSec
+              ? agentConfig.integrations.google.pollIntervalSec * 1000
+              : 60000),
+          gmail: { enabled: gmailEnabled, accounts: gmailAccounts },
+        };
+      })();
+
+      if (pollConfig.enabled && pollConfig.gmail.enabled && pollConfig.gmail.accounts.length > 0) {
+        const pollingService = new PollingService(bot, {
+          intervalMs: pollConfig.intervalMs,
+          workingDir: globalConfig.workingDir,
+          gmail: pollConfig.gmail,
+        });
+        pollingService.start();
+        services.pollingServices.push(pollingService);
+      }
+
+      gateway.addAgent(agentConfig.name, bot);
     }
-    
-    gateway.addAgent(agentConfig.name, bot);
   }
   
   // Start all agents
@@ -675,6 +887,7 @@ async function main() {
     apiKey: apiKey,
     host: apiHost,
     corsOrigin: apiCorsOrigin,
+    narratorScheduler,
   });
   
   // Startup banner
@@ -703,6 +916,8 @@ async function main() {
     services.heartbeatServices.forEach(h => h.stop());
     services.cronServices.forEach(c => c.stop());
     services.pollingServices.forEach(p => p.stop());
+    // Multi-tenant heartbeat services
+    ((services as any).mtHeartbeatServices || []).forEach((h: { stop: () => void }) => h.stop());
     await gateway.stop();
     process.exit(0);
   };

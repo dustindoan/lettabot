@@ -11,6 +11,7 @@ import { listPairingRequests, approvePairingCode } from '../pairing/store.js';
 import { parseMultipart } from './multipart.js';
 import type { AgentRouter } from '../core/interfaces.js';
 import type { ChannelId } from '../core/types.js';
+import type { NarratorScheduler } from '../narrator/scheduler.js';
 
 const VALID_CHANNELS: ChannelId[] = ['telegram', 'slack', 'discord', 'whatsapp', 'signal'];
 const MAX_BODY_SIZE = 10 * 1024; // 10KB
@@ -22,6 +23,7 @@ interface ServerOptions {
   apiKey: string;
   host?: string; // Bind address (default: 127.0.0.1 for security)
   corsOrigin?: string; // CORS origin (default: same-origin only)
+  narratorScheduler?: NarratorScheduler; // Optional — only when Narrator is enabled
 }
 
 /**
@@ -298,6 +300,70 @@ export function createApiServer(deliverer: AgentRouter, options: ServerOptions):
         res.end(JSON.stringify(response));
       } catch (error: any) {
         console.error('[API] Pairing approve error:', error);
+        sendError(res, 500, error.message || 'Internal server error');
+      }
+      return;
+    }
+
+    // Route: POST /api/v1/narrator/synthesize — Trigger Narrator synthesis
+    if (req.url === '/api/v1/narrator/synthesize' && req.method === 'POST') {
+      try {
+        if (!validateApiKey(req.headers, options.apiKey)) {
+          sendError(res, 401, 'Unauthorized');
+          return;
+        }
+        if (!options.narratorScheduler) {
+          sendError(res, 404, 'Narrator not configured');
+          return;
+        }
+
+        let dryRun = false;
+        let context: string | undefined;
+
+        const contentType = req.headers['content-type'] || '';
+        if (contentType.includes('application/json')) {
+          const body = await readBody(req, MAX_BODY_SIZE);
+          try {
+            const parsed = JSON.parse(body);
+            dryRun = parsed.dryRun === true;
+            context = typeof parsed.context === 'string' ? parsed.context : undefined;
+          } catch {
+            // Ignore parse errors — use defaults
+          }
+        }
+
+        console.log(`[API] Narrator synthesis requested (dryRun=${dryRun})`);
+        const response = await options.narratorScheduler.trigger({ dryRun, context });
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          success: true,
+          dryRun,
+          responseLength: response.length,
+          preview: response.slice(0, 500),
+        }));
+      } catch (error: any) {
+        console.error('[API] Narrator synthesis error:', error);
+        sendError(res, 500, error.message || 'Synthesis failed');
+      }
+      return;
+    }
+
+    // Route: GET /api/v1/narrator/status — Get Narrator scheduler status
+    if (req.url === '/api/v1/narrator/status' && req.method === 'GET') {
+      try {
+        if (!validateApiKey(req.headers, options.apiKey)) {
+          sendError(res, 401, 'Unauthorized');
+          return;
+        }
+        if (!options.narratorScheduler) {
+          sendError(res, 404, 'Narrator not configured');
+          return;
+        }
+
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(options.narratorScheduler.getStatus()));
+      } catch (error: any) {
         sendError(res, 500, error.message || 'Internal server error');
       }
       return;
