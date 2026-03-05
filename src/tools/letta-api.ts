@@ -11,11 +11,30 @@ import { createLogger } from '../logger.js';
 const log = createLogger('Letta-api');
 const LETTA_BASE_URL = process.env.LETTA_BASE_URL || 'https://api.letta.com';
 
+// Capture the initial API key at module load as the admin key.
+// Per-user sessions will mutate process.env.LETTA_API_KEY, but admin
+// operations (user provisioning, MCP server setup) always use this key.
+const ADMIN_API_KEY = process.env.LETTA_API_KEY || '';
+
+/** Return the admin API key captured at module load. */
+export function getAdminApiKey(): string {
+  return ADMIN_API_KEY;
+}
+
+/** Return a Letta client using the admin API key (for admin operations). */
+export function getAdminClient(): Letta {
+  return new Letta({
+    apiKey: ADMIN_API_KEY,
+    baseURL: LETTA_BASE_URL,
+    defaultHeaders: { "X-Letta-Source": "lettabot" },
+  });
+}
+
 function getClient(): Letta {
   const apiKey = process.env.LETTA_API_KEY;
   // Local servers may not require an API key
-  return new Letta({ 
-    apiKey: apiKey || '', 
+  return new Letta({
+    apiKey: apiKey || '',
     baseURL: LETTA_BASE_URL,
     defaultHeaders: { "X-Letta-Source": "lettabot" },
   });
@@ -137,11 +156,26 @@ export async function updateAgentModel(agentId: string, model: string): Promise<
  */
 export async function updateAgentName(agentId: string, name: string): Promise<boolean> {
   try {
-    const client = getClient();
+    const client = getAdminClient();
     await client.agents.update(agentId, { name });
     return true;
   } catch (e) {
     log.error('Failed to update agent name:', e);
+    return false;
+  }
+}
+
+/**
+ * Set secrets (environment variables) on an agent.
+ * Used to inject LETTA_USER_ID so MCP custom_headers can resolve {{ LETTA_USER_ID }}.
+ */
+export async function setAgentSecrets(agentId: string, secrets: Record<string, string>): Promise<boolean> {
+  try {
+    const client = getAdminClient();
+    await client.agents.update(agentId, { secrets });
+    return true;
+  } catch (e) {
+    log.error('Failed to set agent secrets:', e);
     return false;
   }
 }
@@ -820,16 +854,250 @@ export async function disableAllToolApprovals(agentId: string): Promise<number> 
   try {
     const tools = await getAgentTools(agentId);
     let disabled = 0;
-    
+
     for (const tool of tools) {
       const success = await disableToolApproval(agentId, tool.name);
       if (success) disabled++;
     }
-    
+
     log.info(`Disabled approval for ${disabled}/${tools.length} tools on agent ${agentId}`);
     return disabled;
   } catch (e) {
     log.error('Failed to disable all tool approvals:', e);
     return 0;
   }
+}
+
+// ============================================================================
+// User Provisioning (sub-agent mode)
+// ============================================================================
+
+/**
+ * Create a Letta user and API key via admin endpoints.
+ * Returns the plaintext API key (only available at creation time).
+ */
+export async function createLettaUser(name: string): Promise<{ userId: string; apiKey: string }> {
+  const adminKey = getAdminApiKey();
+  const baseUrl = LETTA_BASE_URL;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(adminKey ? { Authorization: `Bearer ${adminKey}` } : {}),
+  };
+
+  // 1. Create Letta user (default org)
+  const userResp = await fetch(`${baseUrl}/v1/admin/users/`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      name,
+      organization_id: 'org-00000000-0000-4000-8000-000000000000',
+    }),
+  });
+  if (!userResp.ok) {
+    const body = await userResp.text().catch(() => '');
+    throw new Error(`Failed to create Letta user (${userResp.status}): ${body}`);
+  }
+  const user = (await userResp.json()) as { id: string };
+
+  // 2. Create API key for the user
+  const keyResp = await fetch(`${baseUrl}/v1/admin/api-keys/`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ user_id: user.id, name: `lettabot-${name}` }),
+  });
+  if (!keyResp.ok) {
+    const body = await keyResp.text().catch(() => '');
+    throw new Error(`Failed to create API key for user ${user.id} (${keyResp.status}): ${body}`);
+  }
+  const keyData = (await keyResp.json()) as { key: string };
+
+  log.info(`Provisioned Letta user ${user.id} with API key`);
+  return { userId: user.id, apiKey: keyData.key };
+}
+
+/**
+ * Fetch an agent's secrets from the Letta server.
+ * Returns a map of secret name → plaintext value.
+ */
+export async function getAgentSecrets(agentId: string): Promise<Record<string, string>> {
+  try {
+    const client = getAdminClient();
+    const agent = await client.agents.retrieve(agentId, { include: ['agent.secrets'] });
+    const secrets: Record<string, string> = {};
+    if (Array.isArray(agent.secrets)) {
+      for (const item of agent.secrets) {
+        if (item && typeof item.key === 'string' && typeof item.value === 'string') {
+          secrets[item.key] = item.value;
+        }
+      }
+    }
+    return secrets;
+  } catch (e) {
+    log.error(`Failed to get agent secrets for ${agentId}:`, e);
+    return {};
+  }
+}
+
+// ============================================================================
+// MCP Server Management
+// ============================================================================
+
+export interface McpServerConfig {
+  name: string;
+  url: string;
+  type?: 'sse' | 'streamable_http';
+  customHeaders?: Record<string, string>;
+}
+
+/**
+ * Register an MCP server on Letta by name (idempotent).
+ * If a server with the same name already exists, refreshes it and returns its tools.
+ */
+export async function ensureMcpServer(config: McpServerConfig): Promise<{
+  serverId: string;
+  toolIds: string[];
+  toolNames: string[];
+}> {
+  const client = getAdminClient();
+
+  // Check for existing server with same name
+  const existing = await client.mcpServers.list();
+  const found = existing.find(s => s.server_name === config.name);
+
+  if (found && found.id) {
+    try { await client.mcpServers.refresh(found.id); } catch { /* ignore */ }
+    const tools = await getMcpServerTools(found.id);
+    log.info(`MCP server "${config.name}" already registered (${tools.length} tool(s))`);
+    return { serverId: found.id, toolIds: tools.map(t => t.id), toolNames: tools.map(t => t.name) };
+  }
+
+  // Register new server
+  const serverType = config.type || 'streamable_http';
+  const createConfig: Record<string, unknown> = {
+    server_url: config.url,
+    mcp_server_type: serverType,
+  };
+  if (config.customHeaders && Object.keys(config.customHeaders).length > 0) {
+    createConfig.custom_headers = config.customHeaders;
+  }
+
+  const server = await client.mcpServers.create({
+    server_name: config.name,
+    config: createConfig as { server_url: string; mcp_server_type: 'sse' | 'streamable_http' },
+  });
+
+  const serverId = server.id || '';
+  const tools = await getMcpServerTools(serverId);
+  log.info(`Registered MCP server "${config.name}" with ${tools.length} tool(s)`);
+  return { serverId, toolIds: tools.map(t => t.id), toolNames: tools.map(t => t.name) };
+}
+
+/**
+ * List tools discovered from an MCP server.
+ */
+export async function getMcpServerTools(serverId: string): Promise<Array<{ id: string; name: string }>> {
+  try {
+    const client = getClient();
+    const tools = await client.mcpServers.tools.list(serverId);
+    return tools.map(t => ({ id: t.id, name: t.name ?? 'unknown' }));
+  } catch (e) {
+    log.error(`Failed to list MCP server tools:`, e);
+    return [];
+  }
+}
+
+/**
+ * Look up an MCP server by name in Letta and return its tools.
+ * Returns null if the server is not registered.
+ */
+export async function getMcpServerByName(name: string): Promise<{
+  serverId: string;
+  toolIds: string[];
+  toolNames: string[];
+} | null> {
+  const client = getAdminClient();
+  const servers = await client.mcpServers.list();
+  const found = servers.find(s => s.server_name === name);
+  if (!found?.id) return null;
+
+  const tools = await getMcpServerTools(found.id);
+  return {
+    serverId: found.id,
+    toolIds: tools.map(t => t.id),
+    toolNames: tools.map(t => t.name),
+  };
+}
+
+/**
+ * Filter MCP tool IDs/names by an allowlist or excludelist.
+ *
+ * - If `allowedTools` is provided, only tools whose name is in the list are kept.
+ * - Else if `excludeTools` is provided, tools whose name is in the list are removed.
+ * - If neither is provided, all tools are returned unchanged.
+ */
+export function filterMcpTools(
+  toolIds: string[],
+  toolNames: string[],
+  allowedTools?: string[],
+  excludeTools?: string[],
+): { toolIds: string[]; toolNames: string[] } {
+  const pairs = toolIds.map((id, i) => ({ id, name: toolNames[i] }));
+
+  if (allowedTools && allowedTools.length > 0) {
+    const allowed = new Set(allowedTools);
+    const filtered = pairs.filter(p => allowed.has(p.name));
+    const missing = allowedTools.filter(t => !pairs.some(p => p.name === t));
+    if (missing.length > 0) {
+      log.warn(`allowedTools not found on server: ${missing.join(', ')}`);
+    }
+    return { toolIds: filtered.map(p => p.id), toolNames: filtered.map(p => p.name) };
+  }
+
+  if (excludeTools && excludeTools.length > 0) {
+    const excluded = new Set(excludeTools);
+    const filtered = pairs.filter(p => !excluded.has(p.name));
+    return { toolIds: filtered.map(p => p.id), toolNames: filtered.map(p => p.name) };
+  }
+
+  return { toolIds, toolNames };
+}
+
+/**
+ * Detach a tool from an agent.
+ */
+export async function detachToolFromAgent(agentId: string, toolId: string): Promise<boolean> {
+  try {
+    const client = getAdminClient();
+    await client.agents.tools.detach(toolId, { agent_id: agentId });
+    return true;
+  } catch (e) {
+    log.error(`Failed to detach tool ${toolId} from agent ${agentId}:`, e);
+    return false;
+  }
+}
+
+/**
+ * Attach multiple tools to an agent (idempotent — skips already-attached tools).
+ * Returns the number of newly attached tools.
+ */
+export async function attachToolsToAgent(agentId: string, toolIds: string[]): Promise<number> {
+  const client = getAdminClient();
+  const existingTools = await getAgentTools(agentId);
+  const existingIds = new Set(existingTools.map(t => t.id));
+
+  let attached = 0;
+  for (const toolId of toolIds) {
+    if (existingIds.has(toolId)) continue;
+    try {
+      await client.agents.tools.attach(toolId, { agent_id: agentId });
+      attached++;
+    } catch (e) {
+      log.warn(`Failed to attach tool ${toolId} to agent ${agentId}:`, e);
+    }
+  }
+
+  if (attached > 0) {
+    log.info(`Attached ${attached} tool(s) to agent ${agentId}`);
+  }
+  return attached;
 }

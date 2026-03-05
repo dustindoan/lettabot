@@ -174,6 +174,12 @@ export interface BotConfig {
   conversationOverrides?: string[]; // Channels that always use their own conversation (shared mode)
   maxSessions?: number; // Max concurrent sessions in per-chat mode (default: 10, LRU eviction)
   reuseSession?: boolean; // Reuse SDK subprocess across messages (default: true). Set false to eliminate stream state bleed at cost of ~5s latency per message.
+
+  // MCP servers to attach to new agents (looked up by name in Letta)
+  mcpServers?: Array<{ name: string; allowedTools?: string[]; excludeTools?: string[] }>;
+
+  // Sub-agent spawning (requires conversationMode: per-chat)
+  subAgents?: import('../config/types.js').SubAgentConfig;
 }
 
 /**

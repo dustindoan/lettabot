@@ -610,6 +610,10 @@ async function main() {
       conversationOverrides: agentConfig.conversations?.perChannel,
       maxSessions: agentConfig.conversations?.maxSessions,
       reuseSession: agentConfig.conversations?.reuseSession,
+      mcpServers: agentConfig.mcpServers?.map(s =>
+        typeof s === 'string' ? { name: s } : s
+      ),
+      subAgents: agentConfig.subAgents,
       redaction: agentConfig.security?.redaction,
       cronStorePath,
       skills: {
@@ -809,9 +813,10 @@ async function main() {
     services.cronServices.forEach(c => c.stop());
     services.pollingServices.forEach(p => p.stop());
     await gateway.stop();
+    apiServer.close();
     process.exit(0);
   };
-  
+
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
 }

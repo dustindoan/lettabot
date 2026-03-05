@@ -575,7 +575,13 @@ export class LettaBot implements AgentSession {
           return 'Conversations are disabled -- nothing to reset.';
         }
 
-        this.store.clearConversation(convKey);
+        // In sub-agent mode, clear conversation from the sub-agent's scoped Store.
+        // In other modes, clear from the main store.
+        if (this.config.subAgents && convKey !== 'shared' && convKey !== 'default') {
+          this.sessionManager.clearSubAgentConversation(convKey);
+        } else {
+          this.store.clearConversation(convKey);
+        }
         this.store.resetRecoveryAttempts();
         this.sessionManager.invalidateSession(convKey);
         log.info(`/reset - conversation cleared for key="${convKey}"`);

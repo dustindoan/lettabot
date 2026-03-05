@@ -41,6 +41,18 @@ export interface DisplayConfig {
 }
 
 /**
+ * Sub-agent spawning config.
+ * When present on an agent with conversations.mode: per-chat,
+ * each chat user gets their own Letta agent (sub-agent) cloned
+ * from the template agent config, with isolated identity, secrets,
+ * and OAuth tokens.
+ */
+export interface SubAgentConfig {
+  /** Naming pattern for spawned sub-agents. Supports {name} and {shortId}. Default: "{name}-{shortId}" */
+  naming?: string;
+}
+
+/**
  * Configuration for a single agent in multi-agent mode.
  * Each agent has its own name, channels, and features.
  */
@@ -92,6 +104,14 @@ export interface AgentConfig {
     allowedTools?: string[];       // Per-agent tool whitelist (overrides global/env ALLOWED_TOOLS)
     disallowedTools?: string[];    // Per-agent tool blocklist (overrides global/env DISALLOWED_TOOLS)
   };
+  /** MCP servers to attach to new agents (must be registered in Letta) */
+  mcpServers?: Array<string | {
+    name: string;
+    allowedTools?: string[];   // whitelist — only these tools get attached
+    excludeTools?: string[];   // blacklist — all tools EXCEPT these
+  }>;
+  /** Sub-agent spawning (requires conversations.mode: per-chat) */
+  subAgents?: SubAgentConfig;
   /** Security settings */
   security?: {
     redaction?: {
