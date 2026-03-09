@@ -306,6 +306,24 @@ describe('parseDirectives', () => {
       { type: 'send-file', path: 'report.pdf', caption: 'Report' },
     ]);
   });
+
+  it('parses send-file with only channel (no chat) -- stores partial targeting', () => {
+    const result = parseDirectives(
+      '<actions><send-file path="report.pdf" channel="whatsapp" /></actions>',
+    );
+    expect(result.directives).toEqual([
+      { type: 'send-file', path: 'report.pdf', channel: 'whatsapp' },
+    ]);
+  });
+
+  it('parses send-file with only chat (no channel) -- stores partial targeting', () => {
+    const result = parseDirectives(
+      '<actions><send-file path="report.pdf" chat="123" /></actions>',
+    );
+    expect(result.directives).toEqual([
+      { type: 'send-file', path: 'report.pdf', chat: '123' },
+    ]);
+  });
 });
 
 describe('stripActionsBlock', () => {

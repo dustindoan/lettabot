@@ -363,6 +363,13 @@ export class LettaBot implements AgentSession {
       }
 
       if (directive.type === 'send-file') {
+        // Reject partial targeting: both channel and chat must be set together.
+        // Without this guard, a missing field silently falls back to the triggering chat.
+        if ((directive.channel && !directive.chat) || (!directive.channel && directive.chat)) {
+          log.warn(`Directive send-file skipped: cross-channel targeting requires both channel and chat (got channel=${directive.channel || 'missing'}, chat=${directive.chat || 'missing'})`);
+          continue;
+        }
+
         // Resolve target adapter: use cross-channel targeting if both channel and chat are set,
         // otherwise fall back to the adapter/chatId that triggered this response.
         const targetAdapter = (directive.channel && directive.chat)
@@ -1908,11 +1915,29 @@ export class LettaBot implements AgentSession {
             continue;
           }
 
+          // Parse and execute directives from the response.
+          // Targeted directives (send-message, cross-channel send-file) work in any context.
+          // Non-targeted directives work when source adapter context is available.
+          let executedDirectives = false;
+          if (response.trim()) {
+            const parsed = parseDirectives(response);
+            if (parsed.directives.length > 0) {
+              const sourceAdapter = (context?.sourceChannel ? this.channels.get(context.sourceChannel) : undefined)
+                ?? this.channels.values().next().value;
+              if (sourceAdapter) {
+                executedDirectives = await this.executeDirectives(
+                  parsed.directives, sourceAdapter, context?.sourceChatId ?? '',
+                );
+              }
+              response = parsed.cleanText;
+            }
+          }
+
           if (isSilent && response.trim()) {
-            if (usedMessageCli) {
-              log.info(`Silent mode: agent used lettabot-message CLI, collected ${response.length} chars (not delivered)`);
+            if (usedMessageCli || executedDirectives) {
+              log.info(`Silent mode: agent delivered via ${[usedMessageCli && 'CLI', executedDirectives && 'directives'].filter(Boolean).join(' + ')}, remaining text (${response.length} chars) not delivered`);
             } else {
-              log.warn(`Silent mode: agent produced ${response.length} chars but did NOT use lettabot-message CLI — response discarded. If this keeps happening, the agent's model may not be following silent mode instructions.`);
+              log.warn(`Silent mode: agent produced ${response.length} chars but did NOT use lettabot-message CLI or directives — response discarded. If this keeps happening, the agent's model may not be following silent mode instructions.`);
             }
           }
           return response;
