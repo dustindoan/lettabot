@@ -65,6 +65,7 @@ await refreshTokensIfNeeded();
 import { normalizeAgents } from './config/types.js';
 import { LettaGateway } from './core/gateway.js';
 import { LettaBot } from './core/bot.js';
+import { EdgeProxySession } from './core/edge-proxy-session.js';
 import type { Store } from './core/store.js';
 import { createChannelsForAgent } from './channels/factory.js';
 import { GroupBatcher } from './core/group-batcher.js';
@@ -294,9 +295,10 @@ async function main() {
     process.exit(1);
   }
 
-  // Validate at least one agent has channels
+  // Validate at least one agent has channels (unless API-only mode via PORT or server.api)
   const totalChannels = agents.reduce((sum, a) => sum + Object.keys(a.channels).length, 0);
-  if (totalChannels === 0) {
+  const hasApiServer = !!process.env.PORT || !!yamlConfig.server.api;
+  if (totalChannels === 0 && !hasApiServer) {
     log.error('No channels configured in any agent.');
     log.error('Configure channels in lettabot.yaml or set environment variables.');
     process.exit(1);
@@ -334,7 +336,65 @@ async function main() {
   
   for (const agentConfig of agents) {
     log.info(`Configuring agent: ${agentConfig.name}`);
-    
+
+    // Edge proxy mode: forward to upstream lettabotd instead of running agent locally
+    if (agentConfig.upstream) {
+      const session = new EdgeProxySession({
+        name: agentConfig.name,
+        upstreamUrl: agentConfig.upstream,
+        apiKey: agentConfig.upstreamApiKey || process.env.UPSTREAM_API_KEY,
+        displayName: agentConfig.displayName,
+      });
+
+      // Register channels (edge owns protocol adapters)
+      const adapters = createChannelsForAgent(agentConfig, attachmentsDir, globalConfig.attachmentsMaxBytes);
+      for (const adapter of adapters) {
+        session.registerChannel(adapter);
+      }
+
+      // Group batching still works on edge
+      const { batcher, intervals, instantIds, listeningIds } = createGroupBatcher(agentConfig, session);
+      if (batcher) {
+        session.setGroupBatcher(batcher, intervals, instantIds, listeningIds);
+        services.groupBatchers.push(batcher);
+      }
+
+      gateway.addAgent(agentConfig.name, session);
+      agentChannelMap.set(agentConfig.name, adapters.map(a => a.id));
+
+      // Heartbeat — runs on edge, calls sendToAgent() which forwards upstream
+      const edgeHeartbeatConfig = agentConfig.features?.heartbeat;
+      if (edgeHeartbeatConfig?.enabled) {
+        const edgeWorkingDir = agentConfig.workingDir
+          ? resolveWorkingDirPath(agentConfig.workingDir)
+          : globalConfig.workingDir;
+        const heartbeatService = new HeartbeatService(session, {
+          enabled: true,
+          intervalMinutes: edgeHeartbeatConfig.intervalMin ?? 240,
+          skipRecentUserMinutes: edgeHeartbeatConfig.skipRecentUserMin ?? globalConfig.heartbeatSkipRecentUserMin,
+          skipRecentPolicy: edgeHeartbeatConfig.skipRecentPolicy ?? globalConfig.heartbeatSkipRecentPolicy,
+          skipRecentFraction: edgeHeartbeatConfig.skipRecentFraction ?? globalConfig.heartbeatSkipRecentFraction,
+          agentKey: agentConfig.name,
+          workingDir: edgeWorkingDir,
+          prompt: edgeHeartbeatConfig.prompt || process.env.HEARTBEAT_PROMPT,
+          promptFile: edgeHeartbeatConfig.promptFile,
+          target: parseHeartbeatTarget(edgeHeartbeatConfig.target) || parseHeartbeatTarget(process.env.HEARTBEAT_TARGET),
+        });
+        heartbeatService.start();
+        services.heartbeatServices.push(heartbeatService);
+      }
+
+      // Cron — runs on edge, agent reasons upstream, response delivered locally
+      if (agentConfig.features?.cron ?? globalConfig.cronEnabled) {
+        const cronService = new CronService(session);
+        await cronService.start();
+        services.cronServices.push(cronService);
+      }
+
+      log.info(`Agent ${agentConfig.name}: edge proxy → ${agentConfig.upstream}`);
+      continue; // Skip LettaBot creation, SDK session, agent ID discovery, polling, store
+    }
+
     const resolvedMemfsResult = resolveSessionMemfs({
       configuredMemfs: agentConfig.features?.memfs,
       envMemfs: process.env.LETTABOT_MEMFS,

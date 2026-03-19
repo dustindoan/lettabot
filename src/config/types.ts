@@ -65,6 +65,10 @@ export interface AgentConfig {
   model?: string;
   /** Working directory for this agent's SDK sessions (overrides global) */
   workingDir?: string;
+  /** Upstream lettabotd URL — enables edge proxy mode (no local agent) */
+  upstream?: string;
+  /** API key for upstream lettabotd (falls back to UPSTREAM_API_KEY env var) */
+  upstreamApiKey?: string;
   /** Channels this agent connects to */
   channels: {
     telegram?: TelegramConfig;
